@@ -89,8 +89,11 @@ install.packages(c(
 ## Структура репозитория
 
 ```
-.
-├── IVF_Analysis_Report.Rmd   # основной скрипт анализа
-├── sampled_patients177.csv   # список идентификаторов пациенток
-└── README.md
+├── IVF_Analysis_Report_Maftuna.Rmd    # основной скрипт анализа
+├── IVF_Data_Maftuna.xlsx              # данные (циклы и ооциты)
+├── IVF_Analysis_Report_Maftuna.html   # скомпилированный HTML-отчёт
+├── figure-html/                       # графики, экспортированные при рендеринге
+├── README_RU.md                       # описание на русском языке
+└── README.md                          # описание на английском языке
+
 ```
