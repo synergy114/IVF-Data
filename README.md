@@ -90,7 +90,10 @@ Running the `.Rmd` file produces an HTML report containing:
 
 ```
 .
-├── IVF_Analysis_Report.Rmd   # main analysis script
-├── sampled_patients177.csv   # patient ID list
-└── README.md
+├── IVF_Analysis_Report_Maftuna.Rmd    # main analysis script
+├── IVF_Data_Maftuna.xlsx              # data file (cycles and oocyte sheets)
+├── IVF_Analysis_Report_Maftuna.html   # compiled HTML report
+├── figure-html/                       # figures exported during rendering
+├── README_RU.md                       # README in Russian
+└── README.md                          # README in English
 ```
