@@ -1,0 +1,1179 @@
+---
+title:  "IVF Sample Analysis"
+subtitle: "Day 3 vs Day 5 Embryo Transfer: "
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+author: ""
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi = 150,
+  out.width = "100%"
+)
+```
+
+```{r libraries, include=FALSE}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(ggridges)
+library(geepack)
+library(emmeans)
+library(gtsummary)
+library(gt)
+library(openxlsx)
+library(knitr)
+library(kableExtra)
+library(networkD3)
+library(htmltools)
+
+```
+
+---
+
+# Data Loading & Preparation
+
+```{r load-data}
+FILE_PATH <- "~/Library/CloudStorage/OneDrive-BowlingGreenStateUniversity/IVF Data/Boston_IVF.xlsx"
+
+cycle_types <- c(
+  "numeric","numeric","numeric","numeric","numeric",
+  "numeric","numeric","text","numeric","numeric",
+  "numeric","numeric","numeric","numeric","text",
+  "text","numeric","numeric","numeric","numeric",
+  "numeric","numeric","numeric"
+)
+
+cycles  <- read_excel(FILE_PATH, sheet = "cycles", col_types = cycle_types)
+
+types <- c("text","numeric","text","numeric","numeric",
+           "numeric","numeric","numeric","numeric","numeric",
+           "numeric","numeric","text","text")
+
+oocytes <- read_excel(FILE_PATH,
+                      sheet   = "Oocyte‑level embryo development",
+                      col_types = types)
+
+best_codes  <- read_csv("~/Library/CloudStorage/OneDrive-BowlingGreenStateUniversity/IVF Data/sampled_patients177.csv")
+sub_cycles  <- cycles  %>% dplyr::filter(Patient_Code %in% best_codes$patient_id)
+sub_oocytes <- oocytes %>% dplyr::filter(Patient_Code %in% best_codes$patient_id)
+```
+
+```{r clean-data}
+# ── cycles ────────────────────────────────────────────────────────────────
+sub_cycles_clean <- sub_cycles %>%
+  dplyr::mutate(
+    Sperm_Origin       = as.factor(Sperm_Origin),
+    Day_of_transfer    = as.factor(Day_of_transfer),
+    Implantation       = as.factor(Implantation),
+    `Pregnancy Status` = as.factor(`Pregnancy Status`),
+    pregnancy    = factor(ifelse(`Pregnancy Status` == "pregnancy", 1, 0)),
+    implantation = factor(ifelse(Implantation == "implantation", 1, 0))
+  )
+
+# ── oocytes ───────────────────────────────────────────────────────────────
+blast_labels <- c(
+  "1" = "Early Blastocyst",
+  "2" = "Expanding Blastocyst",
+  "3" = "Full Blastocyst",
+  "4" = "Expanded Blastocyst",
+  "5" = "Hatching Blastocyst",
+  "6" = "Hatched Blastocyst"
+)
+
+sub_oocytes_clean <- sub_oocytes %>%
+  dplyr::mutate(
+    Day_Transfer        = as.factor(Day_Transfer),
+    `Stage at Retrival` = as.factor(`Stage at Retrival`),
+    `Fertility Status PN` = as.factor(`Fertility Status PN`),
+    D5_Stage = suppressWarnings(as.numeric(D5_Stage)),
+    D5_Stage = ifelse(D5_Stage < 0, NA, D5_Stage),
+    D5_Stage = factor(D5_Stage, levels = 1:6, labels = unname(blast_labels))
+  )
+
+# ── analysis dataframe ────────────────────────────────────────────────────
+df <- sub_cycles_clean %>%
+  dplyr::mutate(
+    Day = factor(Day_of_transfer, levels = c("3","5"),
+                 labels = c("Day 3","Day 5")),
+    Age_bin = cut(Patient_Age,
+                  breaks = c(0, 30, 35, 40, 45),
+                  labels = c("<30","30–34","35–39","40–44"),
+                  right  = FALSE),
+    BMI_bin = cut(Producer_BMI,
+                  breaks = c(0, 18.5, 25, 30, 35, Inf),
+                  labels = c("Underweight","Normal","Overweight",
+                             "Obese I","Obese II+"),
+                  right  = FALSE),
+    MII_Rate = 100 * Sum_MII / N_Oocytes,
+    Gravidity_cat = factor(ifelse(Gravidity == 0, "0", "1+"),
+                           levels = c("0","1+")),
+    Sperm_Origin   = droplevels(Sperm_Origin),
+    Fert_Rate      = 100 * Fert_Rate,
+    Cleavage_Rate  = 100 * Cleavage_Rate,
+    Blast_Rate     = 100 * Blast_Rate
+  )
+
+df_gee <- df %>%
+  dplyr::mutate(
+    day_group = factor(Day_of_transfer, levels = c("3","5")),
+    preg_bin  = as.integer(as.character(pregnancy)),
+    impl_bin  = as.integer(as.character(implantation)),
+    fh_bin    = ifelse(is.na(`FH>12wk`),    NA_integer_, as.integer(suppressWarnings(as.numeric(as.character(`FH>12wk`)))    >= 1)),
+    birth_bin = ifelse(is.na(`#_Babies_(>24wks)`), NA_integer_, as.integer(suppressWarnings(as.numeric(as.character(`#_Babies_(>24wks)`))) >= 1)),
+    sacs_bin  = ifelse(is.na(Sacs_Max),     NA_integer_, as.integer(suppressWarnings(as.numeric(as.character(Sacs_Max)))     >= 1)),
+    gravidity_bin = as.integer(Gravidity > 0)
+  ) %>%
+  arrange(Patient_Code)
+
+df_patient <- df %>%
+  arrange(Patient_Code) %>%
+  distinct(Patient_Code, .keep_all = TRUE)
+```
+
+```{r theme-colours, include=FALSE}
+cols       <- c("Day 3" = "#fd5000", "Day 5" = "#00BFC4")
+cols_group <- c("3"     = "#fd5000", "5"     = "#00BFC4")
+col_labels <- c("3" = "Day 3", "5" = "Day 5")
+
+theme_diss <- theme_classic(base_size = 12) +
+  theme(
+    plot.title         = element_text(size = 12, face = "bold", margin = margin(b=6)),
+    plot.subtitle      = element_text(size = 10, color = "grey45", margin = margin(b=8)),
+    plot.caption       = element_text(size = 9,  color = "grey55", hjust = 0),
+    axis.title         = element_text(size = 11),
+    axis.text          = element_text(size = 10),
+    strip.text         = element_text(face = "bold", size = 10),
+    strip.background   = element_blank(),
+    legend.position    = "bottom",
+    legend.title       = element_blank(),
+    panel.grid.major.y = element_line(color = "grey92"),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+```{r sem-helper, include=FALSE}
+# SEM = SD / sqrt(n) — used in gtsummary statistic strings
+sem <- function(x, na.rm = TRUE) {
+  x <- x[!is.na(x)]
+  sd(x) / sqrt(length(x))
+}
+```
+
+```{r gee-functions, include=FALSE}
+# ── GEE helper functions ──────────────────────────────────────────────────
+gee_binary <- function(data, outcome, id_var = "Patient_Code", group = "day_group") {
+  form  <- as.formula(paste(outcome, "~", group))
+  model <- geeglm(form, id = data[[id_var]], data = data,
+                  family = binomial(), corstr = "exchangeable")
+  preds <- as.data.frame(
+    emmeans(model, as.formula(paste("~", group)), type = "response")
+  ) %>%
+    rename_with(~ "estimate", any_of(c("prob", "rate", "emmean"))) %>%
+    dplyr::rename(se = SE) %>%
+    dplyr::mutate(lower = estimate - se, upper = estimate + se)
+  pval  <- summary(model)$coefficients[2, "Pr(>|W|)"]
+  stars <- ifelse(pval < 0.001,"***", ifelse(pval < 0.01,"**",
+           ifelse(pval < 0.05,"*","")))
+  preds %>%
+    dplyr::mutate(outcome = outcome, model_type = "binary",
+           p_value = pval, signif = stars) %>%
+    dplyr::select(outcome, model_type, !!group, estimate, se, lower, upper, p_value, signif)
+}
+
+gee_continuous <- function(data, outcome, id_var = "Patient_Code", group = "day_group") {
+  form  <- as.formula(paste(outcome, "~", group))
+  model <- geeglm(form, id = data[[id_var]], data = data,
+                  family = gaussian(), corstr = "exchangeable")
+  preds <- as.data.frame(emmeans(model, as.formula(paste("~", group)))) %>%
+    dplyr::rename(estimate = emmean, se = SE) %>%
+    dplyr::mutate(lower = estimate - se, upper = estimate + se)
+  pval  <- summary(model)$coefficients[2, "Pr(>|W|)"]
+  stars <- ifelse(pval < 0.001,"***", ifelse(pval < 0.01,"**",
+           ifelse(pval < 0.05,"*","")))
+  preds %>%
+    dplyr::mutate(outcome = outcome, model_type = "continuous",
+           p_value = pval, signif = stars) %>%
+    dplyr::select(outcome, model_type, !!group, estimate, se, lower, upper, p_value, signif)
+}
+
+make_gee_plot <- function(res, y_lab, title = NULL,
+                          is_pct = FALSE, y_lim = NULL) {
+  pval  <- unique(res$p_value)
+  stars <- unique(res$signif)
+  plab  <- if (is.na(pval)) "Day 5 only" else if (pval < 0.001) "p < 0.001" else paste0("p = ", round(pval, 3))
+  annot <- if (is.na(pval)) plab else paste0("GEE Wald: ", plab, " ", stars)
+  ymax  <- if (!is.null(y_lim)) y_lim else max(res$upper, na.rm = TRUE) * 1.20
+  ymid  <- ymax * 0.97
+
+  res %>%
+    dplyr::mutate(day_group = factor(day_group, levels = c("3","5"))) %>%
+    ggplot(aes(x = day_group, y = estimate,
+               color = day_group, fill = day_group)) +
+    geom_col(alpha = 0.35, width = 0.5) +
+    geom_errorbar(aes(ymin = lower, ymax = upper),
+                  width = 0.12, linewidth = 0.9) +
+    geom_point(size = 2, shape = 21, stroke = 1.3) +
+    annotate("text", x = 1.5, y = ymid,
+             label = annot, size = 3.1, color = "grey30") +
+    annotate("segment", x = 1, xend = 2,
+             y = ymid * 0.92, yend = ymid * 0.92,
+             color = "grey65", linewidth = 0.4) +
+    scale_color_manual(values = cols_group) +
+    scale_fill_manual(values  = cols_group) +
+    scale_x_discrete(labels  = col_labels) +
+    scale_y_continuous(
+      labels = if (is_pct) scales::percent_format(accuracy = 1) else waiver(),
+      limits = c(0, ymax),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(x = NULL, y = y_lab,
+         title = title) +
+    theme_diss +
+    theme(legend.position = "none")
+}
+```
+
+---
+
+# Sample Overview
+
+```{r overview}
+tibble(
+  Metric = c("Total cycles","Unique patients",
+             "Day 3 transfers","Day 5 transfers",
+             "Overall pregnancy rate"),
+  Value  = c(
+    nrow(df),
+    n_distinct(df$Patient_Code),
+    sum(df$Day == "Day 3"),
+    sum(df$Day == "Day 5"),
+    paste0(round(mean(df$`Pregnancy Status` == "pregnancy") * 100, 1), "%")
+  )
+) %>%
+  kable(align = c("l","r")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+---
+
+# Demographics
+
+> Patient-level analysis (deduplicated to one row per patient). Age and BMI are patient-level variables — Wilcoxon rank-sum tests are appropriate here.
+
+## Summary table {.tabset}
+
+### Table 1
+
+```{r table1}
+tbl_demo <- df_patient %>%
+  dplyr::select(Day, Patient_Age, Producer_BMI, Gravidity_cat, Sperm_Origin) %>%
+  tbl_summary(
+    by = Day,
+    label = list(
+      Patient_Age   ~ "Age (years)",
+      Producer_BMI  ~ "BMI (kg/m²)",
+      Gravidity_cat ~ "Pregnancy history",
+      Sperm_Origin  ~ "Sperm origin"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{mean} ± {sem}  [{median}, IQR {p25}–{p75}]",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits  = list(all_continuous() ~ 2),
+    missing = "no"
+  ) %>%
+  add_p(test = list(all_continuous()  ~ "wilcox.test",
+                    all_categorical() ~ "chisq.test"),
+        pvalue_fun = ~ style_pvalue(.x, digits = 3)) %>%
+  add_overall() %>%
+  bold_labels() %>%
+  modify_caption("**Table 1. Patient demographics by transfer day**
+                  *Patient-level analysis (n = 1 row per patient)*") %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_footnote(p.value ~ "Wilcoxon rank-sum (continuous); chi-squared (categorical); patient-level")
+
+tbl_demo
+```
+
+### Age bins
+
+```{r table3}
+tbl_age_day <- df_patient %>%
+  count(Age_bin, Day) %>%
+  group_by(Age_bin) %>%
+  dplyr::mutate(Total = sum(n), Pct = round(100 * n / Total, 1)) %>%
+  ungroup() %>%
+  dplyr::mutate(cell = paste0(n, " (", Pct, "%)")) %>%
+  dplyr::select(Age_bin, Day, cell, Total) %>%
+  pivot_wider(names_from = Day, values_from = cell, values_fill = "0 (0%)") %>%
+  dplyr::rename(`Age group` = Age_bin)
+
+chi_age <- chisq.test(table(df_patient$Age_bin, df_patient$Day))
+
+tbl_age_day %>%
+  kable(caption = sprintf("Age group × transfer day. χ²=%.2f, p=%.3f%s",
+                          chi_age$statistic, chi_age$p.value,
+                          ifelse(chi_age$p.value<.001," ***",
+                          ifelse(chi_age$p.value<.01," **",
+                          ifelse(chi_age$p.value<.05," *"," (NS)"))))) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  footnote("n (% within age group); patient-level chi-squared test")
+```
+
+### BMI bins
+
+```{r table4}
+tbl_bmi_day <- df_patient %>%
+  dplyr::filter(!is.na(BMI_bin)) %>%
+  count(BMI_bin, Day) %>%
+  group_by(BMI_bin) %>%
+  dplyr::mutate(Total = sum(n), Pct = round(100 * n / Total, 1)) %>%
+  ungroup() %>%
+  dplyr::mutate(cell = paste0(n, " (", Pct, "%)")) %>%
+  dplyr::select(BMI_bin, Day, cell, Total) %>%
+  pivot_wider(names_from = Day, values_from = cell, values_fill = "0 (0%)") %>%
+  dplyr::rename(`BMI category` = BMI_bin)
+
+chi_bmi <- chisq.test(table(df_patient$BMI_bin, df_patient$Day))
+
+tbl_bmi_day %>%
+  kable(caption = sprintf("BMI category × transfer day. χ²=%.2f, p=%.3f%s",
+                          chi_bmi$statistic, chi_bmi$p.value,
+                          ifelse(chi_bmi$p.value<.001," ***",
+                          ifelse(chi_bmi$p.value<.01," **",
+                          ifelse(chi_bmi$p.value<.05," *"," (NS)"))))) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  footnote("n (% within BMI category); patient-level chi-squared test")
+```
+
+## Age plots
+
+```{r plot-age, fig.height=5}
+wt_age     <- wilcox.test(Patient_Age ~ Day, data = df_patient)
+p_label_age <- sprintf("Wilcoxon p = %.4f%s", wt_age$p.value,
+                        ifelse(wt_age$p.value<.001," ***",
+                        ifelse(wt_age$p.value<.01," **",
+                        ifelse(wt_age$p.value<.05," *"," (NS)"))))
+
+p_viol_age <- ggplot(df_patient,
+                     aes(x = Day, y = Patient_Age, fill = Day)) +
+  geom_violin(alpha = 0.55, trim = FALSE, width = 0.8) +
+  geom_boxplot(width = 0.18, alpha = 0.9, outlier.shape = NA, color = "grey25") +
+  geom_jitter(aes(color = Day), width = 0.08, size = 1.3,
+              alpha = 0.45, show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 3, fill = "white", color = "grey25") +
+  scale_fill_manual(values = cols) +
+  scale_color_manual(values = cols) +
+  annotate("text", x = 1.5, y = max(df_patient$Patient_Age, na.rm=TRUE) + 0.8,
+           label = p_label_age, size = 3.5, color = "grey30") +
+  labs(title = "Patient age by transfer day",
+       subtitle = "Violin + boxplot; diamond = mean; patient-level Wilcoxon",
+       x = NULL, y = "Age (years)", caption = "Whiskers = 1.5 × IQR") +
+  theme_diss + theme(legend.position = "none")
+
+p_ridge_age <- ggplot(df_patient,
+                      aes(x = Patient_Age, y = Day, fill = Day)) +
+  geom_density_ridges(alpha = 0.65, bandwidth = 1.4,
+                      quantile_lines = TRUE, quantiles = c(0.25,0.5,0.75),
+                      jittered_points = TRUE, point_shape = "|",
+                      point_size = 2, point_alpha = 0.5,
+                      position = position_raincloud(adjust_vlines = TRUE)) +
+  scale_fill_manual(values = cols) +
+  labs(title = "Age distribution", x = "Age (years)", y = NULL) +
+  theme_diss + theme(legend.position = "none")
+
+(p_viol_age | p_ridge_age) +
+  plot_annotation(title = "Patient age by transfer day",
+                  caption = "Patient-level analysis",
+                  theme   = theme_diss)
+```
+
+## Age summary table
+
+```{r tbl-age-summary}
+df_patient %>%
+  dplyr::group_by(Day) %>%
+  dplyr::summarise(
+    N       = n(),
+    Mean    = round(mean(Patient_Age, na.rm=TRUE), 1),
+    SE      = round(sd(Patient_Age, na.rm=TRUE)/sqrt(n()), 2),
+    Median  = round(median(Patient_Age, na.rm=TRUE), 1),
+    Q1      = round(quantile(Patient_Age, 0.25, na.rm=TRUE), 1),
+    Q3      = round(quantile(Patient_Age, 0.75, na.rm=TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(`Mean ± SE` = paste0(Mean, " ± ", SE),
+                `Median [IQR]` = paste0(Median, " [", Q1, "–", Q3, "]")) %>%
+  dplyr::select(Day, N, `Mean ± SE`, `Median [IQR]`) %>%
+  kable(caption = "Age by transfer day (patient-level)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+## BMI plot
+
+```{r plot-bmi, fig.height=5}
+wt_bmi     <- wilcox.test(Producer_BMI ~ Day, data = df_patient)
+p_label_bmi <- sprintf("Wilcoxon p = %.4f%s", wt_bmi$p.value,
+                        ifelse(wt_bmi$p.value<.001," ***",
+                        ifelse(wt_bmi$p.value<.01," **",
+                        ifelse(wt_bmi$p.value<.05," *"," (NS)"))))
+
+ggplot(df_patient, aes(x = Day, y = Producer_BMI, fill = Day)) +
+  geom_violin(alpha = 0.55, trim = FALSE, width = 0.8) +
+  geom_boxplot(width = 0.18, alpha = 0.9, outlier.shape = NA, color = "grey25") +
+  geom_jitter(aes(color = Day), width = 0.08, size = 1.3,
+              alpha = 0.35, show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 3, fill = "white", color = "grey25") +
+  geom_hline(yintercept = c(18.5,25,30,35),
+             linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  annotate("text", x = 0.52, y = c(18.5,25,30,35) + 0.6,
+           label = c("18.5","25","30","35"),
+           size = 2.8, color = "grey55", hjust = 0) +
+  scale_fill_manual(values = cols) +
+  scale_color_manual(values = cols) +
+  annotate("text", x = 1.5, y = max(df_patient$Producer_BMI, na.rm=TRUE) + 0.8,
+           label = p_label_bmi, size = 3.5, color = "grey30") +
+  labs(title = "BMI by transfer day",
+       subtitle = "Dashed lines = WHO thresholds; patient-level Wilcoxon",
+       x = NULL, y = "BMI (kg/m²)", caption = "Whiskers = 1.5 × IQR") +
+  theme_diss + theme(legend.position = "none")
+```
+
+
+## BMI summary table
+
+```{r tbl-bmi-summary}
+df_patient %>%
+  dplyr::filter(!is.na(Producer_BMI)) %>%
+  dplyr::group_by(Day) %>%
+  dplyr::summarise(
+    N       = n(),
+    Mean    = round(mean(Producer_BMI, na.rm=TRUE), 1),
+    SE      = round(sd(Producer_BMI, na.rm=TRUE)/sqrt(n()), 2),
+    Median  = round(median(Producer_BMI, na.rm=TRUE), 1),
+    Q1      = round(quantile(Producer_BMI, 0.25, na.rm=TRUE), 1),
+    Q3      = round(quantile(Producer_BMI, 0.75, na.rm=TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(`Mean ± SE` = paste0(Mean, " ± ", SE),
+                `Median [IQR]` = paste0(Median, " [", Q1, "–", Q3, "]")) %>%
+  dplyr::select(Day, N, `Mean ± SE`, `Median [IQR]`) %>%
+  kable(caption = "BMI by transfer day (patient-level)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+---
+
+# Cycle-Level Outcomes
+
+> Cycle-level outcomes use **GEE (generalised estimating equations)** with exchangeable correlation structure, clustered by `Patient_Code`, to account for patients contributing multiple cycles.
+
+```{r run-gee, cache=TRUE}
+# Day-5-only subset for blastocyst outcomes
+df_gee_d5 <- dplyr::filter(df_gee, day_group == "5")
+
+res_oocytes   <- gee_continuous(df_gee, "N_Oocytes")
+res_mii       <- gee_continuous(df_gee, "Sum_MII")
+res_miirate   <- gee_continuous(df_gee, "MII_Rate")
+res_fert2pn   <- gee_continuous(df_gee, "N_Fert_2PN")
+res_fert_rate <- gee_continuous(df_gee, "Fert_Rate")
+res_nd3       <- gee_continuous(df_gee, "N_D3")
+res_cleav     <- gee_continuous(df_gee, "Cleavage_Rate")
+# N_D5 and Blast_Rate: Day-5-only descriptive summary (no Day 3 comparison)
+summarise_d5 <- function(data, outcome) {
+  x <- data[[outcome]]
+  x <- x[!is.na(x)]
+  tibble(
+    outcome    = outcome,
+    model_type = "d5_only",
+    day_group  = "5",
+    estimate   = mean(x),
+    se         = sd(x) / sqrt(length(x)),
+    lower      = mean(x) - sd(x) / sqrt(length(x)),
+    upper      = mean(x) + sd(x) / sqrt(length(x)),
+    p_value    = NA_real_,
+    signif     = ""
+  )
+}
+res_nd5   <- summarise_d5(df_gee_d5, "N_D5")
+res_blast <- summarise_d5(df_gee_d5, "Blast_Rate")
+res_transf    <- gee_continuous(df_gee, "Sum_Transferred")
+res_preg      <- gee_binary(df_gee, "preg_bin")
+res_impl      <- gee_binary(df_gee, "impl_bin")
+res_sacs      <- gee_binary(df_gee, "sacs_bin")
+res_birth     <- gee_binary(df_gee, "birth_bin")
+
+# Implantation rate GEE (sacs/transferred, capped at 1)
+impl_rate_gee_df <- df %>%
+  dplyr::mutate(
+    Sum_Transferred = as.numeric(Sum_Transferred),
+    Sacs_Max        = as.numeric(Sacs_Max),
+    impl_rate       = pmin(Sacs_Max / Sum_Transferred, 1)
+  ) %>%
+  dplyr::filter(!is.na(impl_rate), Sum_Transferred > 0) %>%
+  dplyr::mutate(day_group = factor(Day_of_transfer, levels = c("3","5"))) %>%
+  arrange(Patient_Code)
+res_impl_rate <- gee_continuous(impl_rate_gee_df, "impl_rate")
+
+label_map <- c(
+  N_Oocytes       = "Oocytes retrieved",
+  Sum_MII         = "MII oocytes",
+  MII_Rate        = "MII rate",
+  N_Fert_2PN      = "Fertilized (2PN)",
+  Fert_Rate       = "Fertilization rate",
+  N_D3            = "Embryos at Day 3",
+  Cleavage_Rate   = "Cleavage rate",
+  N_D5            = "Blastocysts at Day 5 (Day 5 cycles only)",
+  Blast_Rate      = "Blastulation rate (Day 5 cycles only)",
+  Sum_Transferred = "Embryos transferred",
+  preg_bin        = "Clinical pregnancy",
+  impl_bin        = "Implantation",
+  impl_rate       = "Implantation rate (sacs/transferred)",
+  sacs_bin        = "Gestational sacs ≥1",
+  birth_bin       = "Live birth >24wk"
+)
+
+gee_results <- bind_rows(
+  res_oocytes, res_mii, res_miirate, res_fert2pn, res_fert_rate,
+  res_nd3, res_cleav, res_nd5, res_blast, res_transf,
+  res_preg, res_impl, res_sacs, res_birth, res_impl_rate
+) %>%
+  dplyr::mutate(label = recode(outcome, !!!label_map))
+
+gee_pvals <- gee_results %>% distinct(outcome, p_value, signif, label)
+```
+
+## Table 2 — Fertility outcomes
+
+```{r table2}
+tbl_fert <- df %>%
+  dplyr::mutate(Day = factor(Day_of_transfer, levels = c("3","5"),
+                      labels = c("Day 3","Day 5"))) %>%
+  dplyr::select(Day, Sum_MII, N_Oocytes, MII_Rate, N_Fert_2PN,
+         Fert_Rate, N_D3, Cleavage_Rate,
+         Sum_Transferred, Implantation, `Pregnancy Status`,
+         Sacs_Max, `#_Babies_(>24wks)`) %>%
+  tbl_summary(
+    by = Day,
+    label = list(
+      Sum_MII             ~ "MII oocytes (sum)",
+      N_Oocytes           ~ "Oocytes retrieved",
+      MII_Rate            ~ "MII rate (%)",
+      N_Fert_2PN          ~ "Fertilized (2PN)",
+      Fert_Rate           ~ "Fertilization rate (%)",
+      N_D3                ~ "Embryos at Day 3",
+      Cleavage_Rate       ~ "Cleavage rate (%)",
+      Sum_Transferred     ~ "Embryos transferred",
+      Implantation        ~ "Implantation",
+      `Pregnancy Status`  ~ "Clinical pregnancy",
+      Sacs_Max            ~ "Gestational sacs (max)",
+      `#_Babies_(>24wks)` ~ "Live birth (>24 wks)"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{mean} ± {sem}  [{median}, IQR {p25}–{p75}]",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      c(MII_Rate, Fert_Rate, Cleavage_Rate) ~ 1
+    ),
+    missing = "no"
+  ) %>%
+  add_overall() %>%
+  bold_labels() %>%
+  modify_caption("**Table 2. Fertility and cycle outcomes by transfer day**
+                  *p-values: GEE Wald test, exchangeable correlation, clustered by patient*") %>%
+  modify_header(label ~ "**Variable**") %>%
+  add_p(
+    test = list(everything() ~ "wilcox.test"),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      dplyr::mutate(p.value = case_when(
+        variable == "Sum_MII"           & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "Sum_MII"],
+        variable == "N_Oocytes"         & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "N_Oocytes"],
+        variable == "MII_Rate"          & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "MII_Rate"],
+        variable == "N_Fert_2PN"        & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "N_Fert_2PN"],
+        variable == "Fert_Rate"         & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "Fert_Rate"],
+        variable == "N_D3"              & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "N_D3"],
+        variable == "Cleavage_Rate"     & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "Cleavage_Rate"],
+        variable == "Sum_Transferred"   & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "Sum_Transferred"],
+        variable == "Implantation"      & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "impl_bin"],
+        variable == "Pregnancy Status"  & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "preg_bin"],
+        variable == "Sacs_Max"          & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "sacs_bin"],
+        variable == "#_Babies_(>24wks)" & row_type == "label" ~
+          gee_pvals$p_value[gee_pvals$outcome == "birth_bin"],
+        TRUE ~ NA_real_
+      ))
+  ) %>%
+  modify_footnote(
+    p.value ~ "GEE Wald test; exchangeable correlation structure, clustered by Patient_Code"
+  )
+
+tbl_fert
+```
+
+## Figure 2 — Continuous outcomes (GEE)
+
+```{r fig2-continuous, fig.height=13}
+p1  <- make_gee_plot(res_oocytes,   "Oocytes retrieved",   title = "Oocytes retrieved")
+p2  <- make_gee_plot(res_mii,       "MII oocytes",         title = "MII oocytes")
+p10 <- make_gee_plot(res_miirate,   "MII rate (%)",        title = "MII rate",          is_pct = FALSE)
+p3  <- make_gee_plot(res_fert2pn,   "Fertilized (2PN)",    title = "Fertilized 2PN")
+p4  <- make_gee_plot(res_fert_rate, "Fertilization rate (%)", title = "Fertilization rate")
+p5  <- make_gee_plot(res_nd3,       "Embryos at Day 3",    title = "Embryos at Day 3")
+p6  <- make_gee_plot(res_cleav,     "Cleavage rate (%)",   title = "Cleavage rate")
+p7  <- make_gee_plot(res_nd5,       "Blastocysts at Day 5",title = "Blastocysts at Day 5")
+p8  <- make_gee_plot(res_blast,     "Blastulation rate (%)", title = "Blastulation rate")
+
+(p1|p2|p10) /
+  (p3|p4)/
+  (p5|p6)+
+  plot_annotation(
+    title = "Oocyte retrival, Fertilization and Cleavage outcomes: Day 3 vs Day 5",
+    subtitle = "GEE marginal means ± SE (exchangeable correlation, clustered by patient)",
+    caption  = "*** p<0.001  ** p<0.01  * p<0.05",
+    theme    = theme_diss
+  )
+
+
+
+```
+
+## Continuous outcomes summary table
+
+```{r tbl-continuous-summary}
+cont_vars <- c("N_Oocytes","Sum_MII","MII_Rate","N_Fert_2PN",
+               "Fert_Rate","N_D3","Cleavage_Rate","Sum_Transferred")
+cont_labels <- c("Oocytes retrieved","MII oocytes","MII rate (%)","Fertilized (2PN)",
+                 "Fertilization rate (%)","Embryos at Day 3","Cleavage rate (%)","Embryos transferred")
+
+purrr::map2_dfr(cont_vars, cont_labels, function(v, lbl) {
+  df %>%
+    dplyr::group_by(Day) %>%
+    dplyr::summarise(
+      Mean   = round(mean(.data[[v]], na.rm=TRUE), 2),
+      SE     = round(sd(.data[[v]], na.rm=TRUE)/sqrt(sum(!is.na(.data[[v]]))), 2),
+      Median = round(median(.data[[v]], na.rm=TRUE), 2),
+      Q1     = round(quantile(.data[[v]], 0.25, na.rm=TRUE), 2),
+      Q3     = round(quantile(.data[[v]], 0.75, na.rm=TRUE), 2),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(Variable = lbl,
+                  `Mean ± SE` = paste0(Mean, " ± ", SE),
+                  `Median [IQR]` = paste0(Median, " [", Q1, "–", Q3, "]")) %>%
+    dplyr::select(Variable, Day, `Mean ± SE`, `Median [IQR]`)
+}) %>%
+  pivot_wider(names_from = Day,
+              values_from = c(`Mean ± SE`, `Median [IQR]`),
+              names_glue = "{Day}: {.value}") %>%
+  kable(caption = "Continuous outcomes by transfer day (cycle-level)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = TRUE)
+```
+
+## Figure 3 — Embryo transfer: Day 3 vs Day 5
+
+```{r fig3-embryo-transfer, fig.height=6}
+# ── descriptive stacked bar ────────────────────────────────────────────────
+transf_counts <- df %>%
+  dplyr::mutate(Transferred = factor(Sum_Transferred)) %>%
+  count(Day, Transferred) %>%
+  group_by(Day) %>%
+  dplyr::mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+p_transf_bar <- ggplot(transf_counts,
+                       aes(x = Day, y = pct, fill = Transferred)) +
+  geom_col(color = "white", linewidth = 0.3, alpha = 0.85) +
+  geom_text(aes(label = ifelse(pct > 4, paste0(n,"\n(",pct,"%)"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  # ggplot default discrete palette
+  guides(fill = guide_legend(title = "N embryos\ntransferred")) +
+  scale_y_continuous(labels = label_percent(scale = 1),
+                     expand = expansion(mult = c(0, 0.03))) +
+  labs(title    = "Embryos transferred — distribution",
+       subtitle = "Stacked bars show proportion per transfer day",
+       x = NULL, y = "% of cycles") +
+  theme_diss + theme(legend.position = "right")
+
+# ── GEE mean with CI ──────────────────────────────────────────────────────
+p_transf_gee <- make_gee_plot(res_transf, "Mean embryos transferred",
+                               title = "Embryos transferred (GEE)")
+
+# ── combined ──────────────────────────────────────────────────────────────
+(p_transf_bar | p_transf_gee) +
+  plot_annotation(
+    title = "Embryo transfer: Day 3 vs Day 5",
+    subtitle = "Left: distribution of embryos transferred | Right: GEE marginal mean ± SE",
+    caption  = "GEE Wald test; exchangeable correlation, clustered by patient",
+    theme    = theme_diss
+  )
+```
+
+## Figure 4 — Binary outcomes (GEE)
+
+```{r fig4-binary, fig.height=6}
+pb1 <- make_gee_plot(res_preg,  "Probability", title = "Clinical pregnancy",
+                     is_pct = TRUE, y_lim = 1)
+pb2 <- make_gee_plot(res_impl,  "Probability", title = "Implantation",
+                     is_pct = TRUE, y_lim = 1)
+pb3 <- make_gee_plot(res_sacs,  "Probability", title = "Gestational sacs ≥1",
+                     is_pct = TRUE, y_lim = 1)
+pb5 <- make_gee_plot(res_birth, "Probability", title = "Live birth >24wk",
+                     is_pct = TRUE, y_lim = 1)
+
+(pb1|pb2)/(pb3|pb5) +
+  plot_annotation(
+    title = "Binary outcomes: Day 3 vs Day 5",
+    subtitle = "GEE estimated probabilities ± SE (exchangeable correlation, clustered by patient)",
+    caption  = "*** p<0.001  ** p<0.01  * p<0.05",
+    theme    = theme_diss
+  )
+```
+
+## Binary outcomes summary table
+
+```{r tbl-binary-summary}
+bin_vars   <- c("preg_bin","impl_bin","sacs_bin","birth_bin")
+bin_labels <- c("Clinical pregnancy","Implantation","Gestational sacs ≥1","Live birth >24wk")
+
+purrr::map2_dfr(bin_vars, bin_labels, function(v, lbl) {
+  df_gee %>%
+    dplyr::group_by(day_group) %>%
+    dplyr::summarise(
+      N    = sum(!is.na(.data[[v]])),
+      n    = sum(.data[[v]], na.rm=TRUE),
+      Pct  = round(100 * mean(.data[[v]], na.rm=TRUE), 1),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(Variable = lbl,
+                  Day = ifelse(day_group == "3", "Day 3", "Day 5"),
+                  `n (%)` = paste0(n, " (", Pct, "%)")) %>%
+    dplyr::select(Variable, Day, `n (%)`)
+}) %>%
+  pivot_wider(names_from = Day, values_from = `n (%)`) %>%
+  kable(caption = "Binary outcomes by transfer day (cycle-level)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+## Table 3 — GEE results summary
+
+```{r table-gee-results}
+gee_results %>%
+  dplyr::filter(day_group %in% c("3", "5")) %>%
+  dplyr::mutate(
+    `Mean ± SE` = paste0(round(estimate, 2), " ± ", round(se, 2)),
+    Group       = ifelse(day_group == "3", "Day 3", "Day 5"),
+    `p-value`   = ifelse(is.na(p_value), "—",
+                    ifelse(p_value < 0.001, "<0.001", round(p_value, 3))),
+    Sig         = ifelse(is.na(signif), "", signif)
+  ) %>%
+  dplyr::select(Outcome = label, Group, `Mean ± SE`, `p-value`, Sig) %>%
+  pivot_wider(names_from = Group,
+              values_from = `Mean ± SE`,
+              names_prefix = "") %>%
+  dplyr::rename(`p-value` = `p-value`, Significance = Sig) %>%
+  # collapse duplicate p-value/sig columns from pivot
+  dplyr::group_by(Outcome) %>%
+  dplyr::summarise(
+    `Day 3`        = dplyr::first(na.omit(`Day 3`)),
+    `Day 5`        = dplyr::first(na.omit(`Day 5`)),
+    `p-value`      = dplyr::first(na.omit(`p-value`)),
+    Significance   = dplyr::first(na.omit(Significance)),
+    .groups = "drop"
+  ) %>%
+  kable(caption = "**Table 3. GEE results: Mean ± SE by transfer day**",
+        align = c("l","r","r","r","l")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE) %>%
+  footnote("GEE Wald test; exchangeable correlation, clustered by Patient_Code.
+            Rates reported as %. Implantation rate capped at 100%.")
+```
+
+
+---
+
+# Oocyte-Level Analysis
+
+```{r oocyte-function, include=FALSE}
+summarise_factor_by_cycle <- function(data, var, id = "Cycle_Code") {
+  var_sym <- sym(var); id_sym <- sym(id)
+  counts <- data %>%
+    dplyr::filter(!is.na(!!var_sym)) %>%
+    group_by(!!id_sym, !!var_sym) %>%
+    dplyr::summarise(n = n(), .groups = "drop")
+  totals <- counts %>%
+    group_by(!!id_sym) %>%
+    dplyr::summarise(total = sum(n), .groups = "drop")
+  lvls <- counts %>% distinct(!!var_sym) %>%
+    pull(!!var_sym) %>% as.character() %>% sort()
+  wide_n <- counts %>%
+    pivot_wider(names_from = !!var_sym, values_from = n, values_fill = 0) %>%
+    rename_with(~ paste0(.x,"_n"), all_of(lvls))
+  wide_pct <- counts %>%
+    left_join(totals, by = id) %>%
+    dplyr::mutate(pct = round(100 * n / total, 1)) %>%
+    dplyr::select(-n,-total) %>%
+    pivot_wider(names_from = !!var_sym, values_from = pct, values_fill = 0) %>%
+    rename_with(~ paste0(.x,"_pct"), all_of(lvls))
+  paired <- as.vector(rbind(paste0(lvls,"_n"), paste0(lvls,"_pct")))
+  wide_n %>%
+    left_join(wide_pct, by = id) %>%
+    left_join(totals, by = id) %>%
+    arrange(!!id_sym) %>%
+    relocate(!!id_sym, total) %>%
+    dplyr::select(!!id_sym, total, all_of(paired))
+}
+```
+
+```{r run-oocyte-tables}
+tbl_stage_retrival <- summarise_factor_by_cycle(sub_oocytes_clean, "Stage at Retrival")
+tbl_fertility_pn   <- summarise_factor_by_cycle(sub_oocytes_clean, "Fertility Status PN")
+tbl_d5_stage       <- summarise_factor_by_cycle(sub_oocytes_clean, "D5_Stage")
+tbl_d5_te          <- summarise_factor_by_cycle(sub_oocytes_clean, "D5_TE")
+```
+
+```{r oocyte-preview}
+kable(head(tbl_stage_retrival, 10),
+      caption = "Stage at retrieval — first 10 cycles shown") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                font_size = 11) %>%
+  scroll_box(width = "100%")
+```
+
+
+
+```{r transfer-sacs-plot}
+# ══════════════════════════════════════════════════════════════════════════
+# PREP
+# ══════════════════════════════════════════════════════════════════════════
+transfer_sacs <- df %>%
+  dplyr::mutate(
+    Sum_Transferred = as.numeric(Sum_Transferred),
+    Sacs_Max        = as.numeric(Sacs_Max)
+  ) %>%
+  dplyr::filter(!is.na(Sum_Transferred), !is.na(Sacs_Max)) %>%
+  count(Day, Sum_Transferred, Sacs_Max) %>%
+  group_by(Day, Sum_Transferred) %>%
+  dplyr::mutate(
+    pct_within_transferred = round(100 * n / sum(n), 1)
+  ) %>%
+  ungroup() %>%
+  dplyr::mutate(
+    Sacs_label = factor(Sacs_Max,
+                        levels = sort(unique(Sacs_Max)),
+                        labels = paste0(sort(unique(Sacs_Max)), " sac(s)"))
+  )
+
+# ══════════════════════════════════════════════════════════════════════════
+# PLOT 1 — stacked bar: for each N transferred, how many sacs
+# ══════════════════════════════════════════════════════════════════════════
+p_stack <- ggplot(transfer_sacs,
+                  aes(x = factor(Sum_Transferred),
+                      y = pct_within_transferred,
+                      fill = Sacs_label)) +
+  geom_col(color = "white", linewidth = 0.3, alpha = 0.88) +
+  geom_text(aes(label = ifelse(pct_within_transferred > 5,
+                               paste0(n, "\n(", pct_within_transferred, "%)"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 2.9, color = "white", fontface = "bold") +
+  facet_wrap(~ Day, ncol = 2) +
+  # ggplot default discrete palette
+  guides(fill = guide_legend(title = "Gestational\nsacs")) +
+  scale_y_continuous(labels = label_percent(scale = 1),
+                     expand = expansion(mult = c(0, 0.03))) +
+  labs(
+    title    = "Gestational sacs by embryos transferred and transfer day",
+    subtitle = "% within each 'embryos transferred' group",
+    x        = "Embryos transferred (N)",
+    y        = "% of cycles",
+    caption  = "n shown inside bars where >5%"
+  ) +
+  theme_diss +
+  theme(legend.position = "right")
+
+# ══════════════════════════════════════════════════════════════════════════
+# PLOT 2 — heatmap: transferred × sacs, split by day
+# ══════════════════════════════════════════════════════════════════════════
+p_heat <- ggplot(transfer_sacs,
+                 aes(x = factor(Sum_Transferred),
+                     y = factor(Sacs_Max),
+                     fill = pct_within_transferred)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = paste0(n, "\n(", pct_within_transferred, "%)")),
+            size = 3, color = "grey20") +
+  facet_wrap(~ Day, ncol = 2) +
+  scale_fill_gradient(low  = "#FFF5F0",
+                      high = "#fd5000",
+                      name = "% within\ntransferred group",
+                      na.value = "grey95") +
+  labs(
+    title    = "Heatmap: embryos transferred vs gestational sacs",
+    subtitle = "% within each 'N transferred' group per transfer day",
+    x        = "Embryos transferred (N)",
+    y        = "Gestational sacs (max)",
+    caption  = "Cell = n cycles (% within row)"
+  ) +
+  theme_diss +
+  theme(legend.position = "right",
+        panel.grid      = element_blank())
+
+# ══════════════════════════════════════════════════════════════════════════
+# PLOT 3 — implantation rate: sacs / transferred per cycle
+# ══════════════════════════════════════════════════════════════════════════
+impl_rate <- df %>%
+  dplyr::mutate(
+    Sum_Transferred = as.numeric(Sum_Transferred),
+    Sacs_Max        = as.numeric(Sacs_Max),
+    impl_rate       = pmin(Sacs_Max / Sum_Transferred, 1)
+  ) %>%
+  dplyr::filter(!is.na(impl_rate), Sum_Transferred > 0)
+
+# GEE for implantation rate (uses df_gee_impl created in run-gee chunk)
+
+pval  <- unique(res_impl_rate$p_value)
+stars <- unique(res_impl_rate$signif)
+plab  <- sprintf("GEE Wald: p = %s %s",
+                 ifelse(pval < .001, "<0.001", round(pval, 3)), stars)
+
+p_impl_rate <- ggplot(impl_rate,
+                      aes(x = Day, y = impl_rate, fill = Day)) +
+ geom_violin(alpha = 0.45, trim = FALSE, width = 0.8) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.shape = NA,
+               color = "grey25") +
+  geom_jitter(aes(color = Day), width = 0.08, size = 1.3,
+              alpha = 0.35, show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 3, fill = "white", color = "grey25") +
+  scale_fill_manual(values  = cols) +
+  scale_color_manual(values = cols) +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  annotate("text", x = 1.5,
+           y     = max(impl_rate$impl_rate, na.rm = TRUE) * 1.05,
+           label = plab, size = 3.4, color = "grey30") +
+  labs(
+    title    = "Implantation rate per cycle",
+    subtitle = "Sacs_Max / Sum_Transferred, capped at 100%; GEE Wald test",
+    x        = NULL,
+    y        = "Implantation rate (sacs / transferred)",
+    caption  = "*** p<0.001  ** p<0.01  * p<0.05"
+  ) +
+  theme_diss + theme(legend.position = "none")
+
+# ══════════════════════════════════════════════════════════════════════════
+# COMBINED FIGURE
+# ══════════════════════════════════════════════════════════════════════════
+p_stack 
+
+p_heat
+
+  
+
+ p_impl_rate
+ 
+df %>%
+  dplyr::mutate(
+    Transferred = factor(as.numeric(Sum_Transferred)),
+    Sacs        = factor(as.numeric(Sacs_Max))
+  ) %>%
+  dplyr::filter(!is.na(Transferred), !is.na(Sacs)) %>%
+ count(Day, Transferred, Sacs) %>%
+  group_by(Day, Transferred) %>%
+  dplyr::mutate(pct = round(100 * n / sum(n), 1),
+                cell = paste0(n, " (", pct, "%)")) %>%
+  dplyr::select(-n, -pct) %>%
+  pivot_wider(names_from = c(Day, Sacs), values_from = cell,
+              values_fill = "0 (0%)", names_glue = "{Day} — {Sacs} sac(s)")%>%
+  dplyr::rename(`Embryos transferred` = Transferred) %>%
+  kable(
+    caption = "Counts of embryos transferred × gestational sacs (max), by transfer day",
+    align   = "c"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  add_header_above(
+    # dynamically build the header: count how many sac levels exist per day
+    c(" " = 1,
+      "Day 3" = length(unique(df$Sacs_Max[df$Day == "Day 3" & !is.na(df$Sacs_Max)])),
+      "Day 5" = length(unique(df$Sacs_Max[df$Day == "Day 5" & !is.na(df$Sacs_Max)]))
+    )
+  ) %>%
+  footnote("Cells = number of cycles. Columns are max gestational sacs observed per cycle.")
+```
+
+
+
+
+## Implantation rate summary table
+
+```{r tbl-impl-rate-summary}
+impl_rate_gee_df %>%
+  dplyr::group_by(day_group) %>%
+  dplyr::summarise(
+    N      = n(),
+    Mean   = round(mean(impl_rate, na.rm=TRUE), 3),
+    SE     = round(sd(impl_rate, na.rm=TRUE)/sqrt(n()), 3),
+    Median = round(median(impl_rate, na.rm=TRUE), 3),
+    Q1     = round(quantile(impl_rate, 0.25, na.rm=TRUE), 3),
+    Q3     = round(quantile(impl_rate, 0.75, na.rm=TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Day           = ifelse(day_group == "3", "Day 3", "Day 5"),
+    `Mean ± SE`   = paste0(round(Mean*100,1), "% ± ", round(SE*100,1), "%"),
+    `Median [IQR]`= paste0(round(Median*100,1), "% [", round(Q1*100,1), "–", round(Q3*100,1), "%]")
+  ) %>%
+  dplyr::select(Day, N, `Mean ± SE`, `Median [IQR]`) %>%
+  kable(caption = "Implantation rate by transfer day (sacs/transferred, capped at 100%)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+
+
+# Export to Excel
+
+```{r excel-export}
+# Helper: make column names unique (case-insensitive) for openxlsx
+dedup_colnames <- function(tbl) {
+  nms <- colnames(tbl)
+  # lowercase comparison to catch case-insensitive duplicates
+  nms_lower <- tolower(nms)
+  seen <- list()
+  for (i in seq_along(nms_lower)) {
+    key <- nms_lower[i]
+    if (!is.null(seen[[key]])) {
+      seen[[key]] <- seen[[key]] + 1L
+      nms[i] <- paste0(nms[i], "_", seen[[key]])
+    } else {
+      seen[[key]] <- 1L
+    }
+  }
+  colnames(tbl) <- nms
+  tbl
+}
+
+export_tables_excel <- function(table_list, file) {
+  wb <- createWorkbook()
+  walk2(table_list, names(table_list), function(tbl, sheet_name) {
+    sname <- substr(sheet_name, 1, 31)
+    tbl   <- dedup_colnames(as.data.frame(tbl))   # deduplicate before writing
+    addWorksheet(wb, sname)
+    writeDataTable(wb, sname, tbl, tableStyle = "TableStyleMedium2")
+    setColWidths(wb, sname, cols = 1:ncol(tbl), widths = "auto")
+    freezePane(wb, sname, firstRow = TRUE)
+    hs <- createStyle(fontColour = "#FFFFFF", fgFill = "#fd5000",
+                      halign = "CENTER", textDecoration = "Bold",
+                      border = "Bottom", borderColour = "#00BFC4")
+    addStyle(wb, sname, hs, rows = 1, cols = 1:ncol(tbl), gridExpand = TRUE)
+  })
+  saveWorkbook(wb, file, overwrite = TRUE)
+  cat("Saved:", file, "\n")
+}
+
+# ── output folder ─────────────────────────────────────────────────────────
+out_dir <- file.path(
+  "~/Library/CloudStorage/OneDrive-BowlingGreenStateUniversity/IVF Data",
+  "IVF_Analysis_Output"
+)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ── flatten gtsummary tables ───────────────────────────────────────────────
+tbl_demo_flat <- tbl_demo %>% as_tibble() %>% dplyr::select(-any_of("stat_0"))
+tbl_fert_flat <- tbl_fert %>% as_tibble() %>% dplyr::select(-any_of("stat_0"))
+
+# ── GEE summary ───────────────────────────────────────────────────────────
+gee_summary <- gee_results %>%
+  dplyr::mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  dplyr::select(label, model_type, day_group, estimate, se, lower, upper,
+         p_value, signif)
+
+export_tables_excel(
+  list(
+    # raw data
+    "Data cycles"           = sub_cycles_clean %>%
+                                dplyr::mutate(across(where(is.factor), as.character)),
+    "Data oocytes"          = sub_oocytes_clean %>%
+                                dplyr::mutate(across(where(is.factor), as.character)),
+    # summary tables
+    "Table1 Demographics"   = tbl_demo_flat,
+    "Table2 Fertility"      = tbl_fert_flat,
+    "Table3 Age Bin"        = tbl_age_day,
+    "Table4 BMI Bin"        = tbl_bmi_day,
+    # GEE results
+    "GEE Results"           = gee_summary,
+    # oocyte tables
+    "Oocyte Stage Retrival" = tbl_stage_retrival,
+    "Oocyte Fertility PN"   = tbl_fertility_pn,
+    "Oocyte D5 Stage"       = tbl_d5_stage,
+    "Oocyte D5 TE"          = tbl_d5_te
+  ),
+  file.path(out_dir, "All_Tables.xlsx")
+)
+```
+
+---
+
+# Statistical Methods Summary
+
+```{r methods-table, echo=FALSE}
+tibble(
+  `Variable type`      = c("Age, BMI, gravidity","Age bin, BMI bin",
+                            "Sperm origin","Cycle outcomes (continuous)",
+                            "Pregnancy, implantation","Adjusted pregnancy"),
+  `Unit of analysis`   = c("Patient","Patient","Patient",
+                            "Cycle","Cycle","Cycle"),
+  `Test used`          = c("Wilcoxon rank-sum","Chi-squared","Chi-squared",
+                            "GEE (Gaussian)","GEE (binomial logit)",
+                            "GEE multivariable"),
+  `Reason`             = c("1 row/patient — independent","1 row/patient — independent",
+                            "1 row/patient — independent",
+                            "Clustered by patient","Clustered by patient",
+                            "Clustered; age/BMI adjusted")
+) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = TRUE)
+```
+
+> All GEE models used **exchangeable correlation structure** (assumes equal correlation between any two cycles from the same patient) and were clustered by `Patient_Code`. P-values are from **GEE Wald tests** (χ², 1 df).
+
+---
+
+*Report generated: `r format(Sys.time(), "%Y-%m-%d %H:%M")`*
